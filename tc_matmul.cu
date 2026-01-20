@@ -34,13 +34,30 @@ using namespace nvcuda;
 
 constexpr int BM = 128;
 constexpr int BN = 128;
-constexpr int BK = 32;
-constexpr int PAD = 8;
-
-constexpr int WARPS_M = 8;
-constexpr int WARPS_N = 4;
+constexpr int BK = 64;
+constexpr int WARPS_M = 4;
+constexpr int WARPS_N = 2;
 constexpr int WARPS_PER_BLOCK = WARPS_M * WARPS_N;
 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
+constexpr int STAGES = 2;
+
+__device__ __forceinline__ void cp_async_16(void* smem_ptr, const void* gmem_ptr, bool guard) {
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    int src_size = guard ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(smem_addr), "l"(gmem_ptr), "r"(src_size));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait() {
+    if constexpr (N == 0) asm volatile("cp.async.wait_group 0;\n" ::);
+    else if constexpr (N == 1) asm volatile("cp.async.wait_group 1;\n" ::);
+    else if constexpr (N == 2) asm volatile("cp.async.wait_group 2;\n" ::);
+    else asm volatile("cp.async.wait_all;\n" ::);
+}
 
 __global__ void tensorMatMul(
     const half* __restrict__ A, 
@@ -48,134 +65,113 @@ __global__ void tensorMatMul(
     float* __restrict__ C, 
     int M, int N, int K) 
 {
-    // Shared memory layout: Double buffered
-    // Padding +8 helps prevent bank conflicts for 128-bit loads
-    extern __shared__ half smem[];
     const int stride_A = BK + 8; 
     const int stride_B = BN + 8;
+    const int A_tile_size = BM * stride_A;
+    const int B_tile_size = BK * stride_B;
 
-    half* smem_A[2] = { smem, smem + BM * stride_A };
-    half* smem_B[2] = { smem + 2 * BM * stride_A, smem + 2 * BM * stride_A + BK * stride_B };
+    extern __shared__ half smem[];
+    half* smem_A[STAGES];
+    half* smem_B[STAGES];
+    for (int i = 0; i < STAGES; ++i) {
+        smem_A[i] = smem + i * A_tile_size;
+        smem_B[i] = smem + STAGES * A_tile_size + i * B_tile_size;
+    }
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
-    const int warp_m = warp_id / (BN / 32); // Assuming 2 fragments wide
-    const int warp_n = warp_id % (BN / 32);
+    const int warp_m = warp_id / WARPS_N; 
+    const int warp_n = warp_id % WARPS_N;
 
     const int block_m = blockIdx.y * BM;
     const int block_n = blockIdx.x * BN;
 
-    // Fragments for 16x16x16 WMMA
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
-    wmma::fill_fragment(acc[0], 0.0f);
-    wmma::fill_fragment(acc[1], 0.0f);
-
-    auto pipe = cuda::make_pipeline();
-    int stage = 0;
-
-    // Pre-calculate Global Memory Pointers
-    // Treat as uint4 (8 halves) for 128-bit coalesced loads
-    const uint4* A_ptr = reinterpret_cast<const uint4*>(A);
-    const uint4* B_ptr = reinterpret_cast<const uint4*>(B);
-
-    // --- PROLOGUE: Initial Load (kt = 0) ---
-    pipe.producer_acquire();
-    
-    // Vectorized Load A (Each thread loads 8 elements)
+    // Warp tile: 32x64 (2x4 fragments)
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
     #pragma unroll
-    for (int i = tid; i < (BM * BK) / 8; i += THREADS_PER_BLOCK) {
-        int r = i / (BK / 8); // Division by constant is optimized by compiler to shifts
-        int c = i % (BK / 8);
-        int g_row = block_m + r;
-        int g_col = c * 8; 
-        
-        uint4 val = (g_row < M && g_col < K) ? A_ptr[(g_row * K + g_col) / 8] : make_uint4(0,0,0,0);
-        reinterpret_cast<uint4*>(&smem_A[stage][r * stride_A + c * 8])[0] = val;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 4; ++j)
+            wmma::fill_fragment(acc[i][j], 0.0f);
+
+    // Prologue
+    int kt = 0;
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (kt < K) {
+            #pragma unroll
+            for (int i = tid; i < (BM * BK) / 8; i += THREADS_PER_BLOCK) {
+                int r = i / (BK / 8); int c = i % (BK / 8);
+                cp_async_16(&smem_A[s][r * stride_A + c * 8], &A[(block_m + r) * K + kt + c * 8], (block_m + r < M && kt + c * 8 < K));
+            }
+            #pragma unroll
+            for (int i = tid; i < (BK * BN) / 8; i += THREADS_PER_BLOCK) {
+                int r = i / (BN / 8); int c = i % (BN / 8);
+                cp_async_16(&smem_B[s][r * stride_B + c * 8], &B[(kt + r) * N + block_n + c * 8], (kt + r < K && block_n + c * 8 < N));
+            }
+        }
+        cp_async_commit();
+        kt += BK;
     }
 
-    // Vectorized Load B
-    #pragma unroll
-    for (int i = tid; i < (BK * BN) / 8; i += THREADS_PER_BLOCK) {
-        int r = i / (BN / 8);
-        int c = i % (BN / 8);
-        int g_row = r;
-        int g_col = block_n + c * 8;
-
-        uint4 val = (g_row < K && g_col < N) ? B_ptr[(g_row * N + g_col) / 8] : make_uint4(0,0,0,0);
-        reinterpret_cast<uint4*>(&smem_B[stage][r * stride_B + c * 8])[0] = val;
-    }
-    pipe.producer_commit();
-
-    // --- MAIN LOOP ---
-    for (int kt = BK; kt < K; kt += BK) {
-        pipe.consumer_wait();
+    // Main Loop
+    int compute_stage = 0;
+    for (int k_idx = 0; k_idx < K; k_idx += BK) {
+        cp_async_wait<STAGES - 2>();
         __syncthreads();
 
-        // Start Math on current stage
-        int next_stage = stage ^ 1;
-        
-        // Asynchronous Prefetch for next stage
-        pipe.producer_acquire();
-        #pragma unroll
-        for (int i = tid; i < (BM * BK) / 8; i += THREADS_PER_BLOCK) {
-            int r = i / (BK / 8); int c = i % (BK / 8);
-            int g_col = kt + c * 8;
-            uint4 val = (block_m + r < M && g_col < K) ? A_ptr[((block_m + r) * K + g_col) / 8] : make_uint4(0,0,0,0);
-            reinterpret_cast<uint4*>(&smem_A[next_stage][r * stride_A + c * 8])[0] = val;
+        // Prefetch next
+        int fetch_stage = (compute_stage + STAGES - 1) % STAGES;
+        if (kt < K) {
+            #pragma unroll
+            for (int i = tid; i < (BM * BK) / 8; i += THREADS_PER_BLOCK) {
+                int r = i / (BK / 8); int c = i % (BK / 8);
+                cp_async_16(&smem_A[fetch_stage][r * stride_A + c * 8], &A[(block_m + r) * K + kt + c * 8], (block_m + r < M && kt + c * 8 < K));
+            }
+            #pragma unroll
+            for (int i = tid; i < (BK * BN) / 8; i += THREADS_PER_BLOCK) {
+                int r = i / (BN / 8); int c = i % (BN / 8);
+                cp_async_16(&smem_B[fetch_stage][r * stride_B + c * 8], &B[(kt + r) * N + block_n + c * 8], (kt + r < K && block_n + c * 8 < N));
+            }
         }
-        #pragma unroll
-        for (int i = tid; i < (BK * BN) / 8; i += THREADS_PER_BLOCK) {
-            int r = i / (BN / 8); int c = i % (BN / 8);
-            int g_row = kt + r;
-            uint4 val = (g_row < K && block_n + c * 8 < N) ? B_ptr[(g_row * N + block_n + c * 8) / 8] : make_uint4(0,0,0,0);
-            reinterpret_cast<uint4*>(&smem_B[next_stage][r * stride_B + c * 8])[0] = val;
-        }
-        pipe.producer_commit();
+        cp_async_commit();
 
         // Compute current stage
-        int warp_row = warp_m * 16;
-        int warp_col = warp_n * 32;
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+        int warp_row_off = warp_m * 32;
+        int warp_col_off = warp_n * 64;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag[2];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[4];
 
         #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
-            wmma::load_matrix_sync(a_frag, &smem_A[stage][warp_row * stride_A + kk], stride_A);
-            wmma::load_matrix_sync(b_frag, &smem_B[stage][kk * stride_B + warp_col], stride_B);
-            wmma::mma_sync(acc[0], a_frag, b_frag, acc[0]);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                wmma::load_matrix_sync(a_frag[i], &smem_A[compute_stage][(warp_row_off + i * 16) * stride_A + kk], stride_A);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                wmma::load_matrix_sync(b_frag[j], &smem_B[compute_stage][kk * stride_B + warp_col_off + j * 16], stride_B);
 
-            wmma::load_matrix_sync(b_frag, &smem_B[stage][kk * stride_B + warp_col + 16], stride_B);
-            wmma::mma_sync(acc[1], a_frag, b_frag, acc[1]);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
         }
-        
-        stage = next_stage;
+
+        compute_stage = (compute_stage + 1) % STAGES;
+        kt += BK;
     }
 
-    // --- FINAL COMPUTE ---
-    pipe.consumer_wait();
-    __syncthreads();
-    
-    int warp_row = warp_m * 16;
-    int warp_col = warp_n * 32;
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-
+    // Store results
+    int warp_row_off = warp_m * 32;
+    int warp_col_off = warp_n * 64;
     #pragma unroll
-    for (int kk = 0; kk < BK; kk += 16) {
-        wmma::load_matrix_sync(a_frag, &smem_A[stage][warp_row * stride_A + kk], stride_A);
-        wmma::load_matrix_sync(b_frag, &smem_B[stage][kk * stride_B + warp_col], stride_B);
-        wmma::mma_sync(acc[0], a_frag, b_frag, acc[0]);
-        wmma::load_matrix_sync(b_frag, &smem_B[stage][kk * stride_B + warp_col + 16], stride_B);
-        wmma::mma_sync(acc[1], a_frag, b_frag, acc[1]);
-    }
-
-    // --- STORE RESULTS ---
-    #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-        int out_r = block_m + warp_row;
-        int out_c = block_n + warp_col + (j * 16);
-        if (out_r < M && out_c < N) {
-            wmma::store_matrix_sync(&C[out_r * N + out_c], acc[j], N, wmma::mem_row_major);
+    for (int i = 0; i < 2; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int out_r = block_m + warp_row_off + i * 16;
+            int out_c = block_n + warp_col_off + j * 16;
+            if (out_r < M && out_c < N) {
+                wmma::store_matrix_sync(&C[out_r * N + out_c], acc[i][j], N, wmma::mem_row_major);
+            }
         }
     }
 }
@@ -251,11 +247,12 @@ int main(int argc, char** argv) {
 
     dim3 block(THREADS_PER_BLOCK);
     dim3 grid(CEIL_DIV(N, BN), CEIL_DIV(N, BM));
-    int stride_A = BK + PAD;
-    int stride_B = BN + PAD;
-    size_t smem_size = (2 * BM * stride_A + 2 * BK * stride_B) * sizeof(half);
+    int stride_A = BK + 8;
+    int stride_B = BN + 8;
+    size_t smem_size = STAGES * (BM * stride_A + BK * stride_B) * sizeof(half);
 
     // Kernel Call
+    CUDA_CHECK(cudaFuncSetAttribute(tensorMatMul, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     tensorMatMul<<<grid, block, smem_size>>>(d_A, d_B, d_C, N, N, N);
     CUDA_CHECK(cudaDeviceSynchronize());
 
