@@ -4,7 +4,7 @@ High-performance matrix multiplication kernels written to push CUDA limits and l
 
 **Focus**: GEMM implementations that exploit **Tensor Cores** and optimized classical GEMM patterns, aiming for maximum TFLOPS on NVIDIA GPUs.
 
-Performance has been tested on **NVIDIA Ampere** RTX 3070 GPUs, with a maximum of 0.5x cuBLAS performance while maintaining perfect accuracy.
+Performance has been tested on **NVIDIA Ampere** RTX 3070 GPUs, with a maximum of 0.7x cuBLAS performance while maintaining perfect accuracy.
 
 ## Key Implementations
 
@@ -17,7 +17,7 @@ High-throughput matrix multiplication using **WMMA** / Tensor Core instructions.
 - Tiled/shared memory loading optimized with 128-bit vectorization
 - Double buffering to hide memory latency
 - Asynchronous [CUDA Pipelining](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/pipelines.html) for overlapping compute & data transfers between global/shared memory.
-- Very high TFLOPS utilization, with 20 TFLOPS on Ampere
+- Very high TFLOPS utilization, with 28 TFLOPS on Ampere
 
 Currently, the fastest single-file GEMM kernel in this repo.
 
